@@ -1,0 +1,120 @@
+#!/bin/bash
+# portal — halka açık Wi-Fi (captive portal) modu toggle
+#
+#   sudo portal off   → giriş ekranının açılabilmesi için DNS katmanlarını indirir
+#   sudo portal on    → şifreli DNS + zapret'i geri getirir
+#        portal status → mevcut durumu gösterir (root gerekmez)
+#
+# Neden gerekli: dnsguard, DHCP'nin verdiği portal DNS'ini anında 127.0.0.1'e
+# geri çeviriyor; dnscrypt-proxy de giriş öncesi bloke olan 443 üzerinden
+# sorgu yapmaya çalışıyor. İkisi birlikte macOS'un portal algılamasını kırıyor.
+
+set -u
+
+# Change these to match your setup. dnsguard is the service that keeps DNS on 127.0.0.1.
+# If you change the label, dnsguardLabel in main.swift has to match.
+DNSGUARD_LABEL="com.gadz.dnsguard"
+DNSGUARD_PLIST="/Library/LaunchDaemons/$DNSGUARD_LABEL.plist"
+ZAPRET_LABEL="com.darkware.zapret"
+ZAPRET_PLIST="/Library/LaunchDaemons/com.darkware.zapret.plist"
+ZAPRET_CTL="/opt/darkware-zapret/init.d/macos/zapret"
+
+red()  { printf '\033[31m%s\033[0m\n' "$*"; }
+grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
+ylw()  { printf '\033[33m%s\033[0m\n' "$*"; }
+
+need_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    red "Root gerekiyor:  sudo portal $1"
+    exit 1
+  fi
+}
+
+net_services() {
+  networksetup -listallnetworkservices 2>/dev/null | tail -n +2 | grep -v '^\*'
+}
+
+flush_dns() {
+  dscacheutil -flushcache 2>/dev/null
+  killall -HUP mDNSResponder 2>/dev/null
+  return 0
+}
+
+case "${1:-status}" in
+
+  off)
+    need_root off
+
+    echo "==> dnsguard durduruluyor"
+    launchctl bootout "system/$DNSGUARD_LABEL" 2>/dev/null \
+      && echo "    durduruldu" || echo "    zaten kapalıydı"
+
+    echo "==> DNS DHCP'ye bırakılıyor"
+    net_services | while IFS= read -r s; do
+      networksetup -setdnsservers "$s" empty 2>/dev/null && echo "    $s"
+    done
+
+    echo "==> zapret durduruluyor"
+    [ -x "$ZAPRET_CTL" ] && "$ZAPRET_CTL" stop >/dev/null 2>&1
+    launchctl bootout "system/$ZAPRET_LABEL" 2>/dev/null
+    echo "    durduruldu"
+
+    flush_dns
+    echo
+    grn "KAFE MODU AÇIK"
+    echo
+    echo "1) Wi-Fi'ye bağlan — giriş ekranı kendiliğinden açılmalı"
+    echo "2) Açılmazsa tarayıcıda şunu aç:"
+    echo "      http://captive.apple.com/hotspot-detect.html"
+    echo "   ('Success' yazısı görürsen portal yok, internet zaten açık)"
+    echo "3) Giriş yaptıktan sonra MUTLAKA:  sudo portal on"
+    echo
+    ylw "DİKKAT: şu an şifreli DNS ve zapret KAPALI. Bu ağda hangi sitelere"
+    ylw "girdiğin görünür. Giriş yapar yapmaz 'portal on' çalıştır."
+    ;;
+
+  on)
+    need_root on
+
+    echo "==> dnsguard geri yükleniyor"
+    launchctl bootstrap system "$DNSGUARD_PLIST" 2>/dev/null \
+      && echo "    yüklendi" || echo "    zaten yüklüydü"
+
+    echo "==> zapret geri yükleniyor"
+    launchctl bootstrap system "$ZAPRET_PLIST" 2>/dev/null \
+      && echo "    yüklendi" || echo "    zaten yüklüydü"
+
+    echo "==> DNS 127.0.0.1'e alınıyor"
+    net_services | while IFS= read -r s; do
+      networksetup -setdnsservers "$s" 127.0.0.1 2>/dev/null && echo "    $s"
+    done
+
+    flush_dns
+    sleep 2
+
+    echo
+    echo "==> doğrulama"
+    if dig +short +time=3 +tries=1 @127.0.0.1 cloudflare.com >/dev/null 2>&1; then
+      grn "NORMAL MOD AÇIK — şifreli DNS çalışıyor"
+    else
+      red "UYARI: 127.0.0.1:53 cevap vermiyor, dnscrypt-proxy'yi kontrol et:"
+      echo "   sudo launchctl kickstart -k system/homebrew.mxcl.dnscrypt-proxy"
+    fi
+    ;;
+
+  status)
+    echo "Wi-Fi DNS      : $(networksetup -getdnsservers "Wi-Fi" 2>/dev/null | tr '\n' ' ')"
+    echo "Aktif çözümleyici: $(scutil --dns 2>/dev/null | awk '/nameserver\[0\]/{print $3; exit}')"
+    printf "dnsguard       : "
+    launchctl print "system/$DNSGUARD_LABEL" >/dev/null 2>&1 && grn "yüklü" || ylw "kapalı"
+    printf "zapret (tpws)  : "
+    pgrep -q tpws && grn "çalışıyor" || ylw "kapalı"
+    printf "dnscrypt-proxy : "
+    pgrep -q dnscrypt-proxy && grn "çalışıyor" || red "kapalı"
+    ;;
+
+  *)
+    echo "Kullanım: sudo portal {off|on}   |   portal status"
+    exit 1
+    ;;
+esac
